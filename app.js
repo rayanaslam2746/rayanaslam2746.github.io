@@ -28,9 +28,11 @@
  * previous face into this one, scrubbed 1:1) -> panelIn (cube frozen,
  * panel slides in) -> hold (frozen, dead scroll) -> panelOut (frozen,
  * panel slides out) -> next face's rotate. The very first face has no
- * incoming rotate (nothing to rotate from) and the very last face has no
- * outgoing panelOut (nothing to transition to) — those two segments are
- * simply omitted at the open ends of the timeline.
+ * incoming rotate or panelIn (nothing to transition in from — name and
+ * hint are already fully visible at progress=0, on load, not something
+ * you have to scroll to reveal) and the very last face has no outgoing
+ * panelOut (nothing to transition to) — those segments are simply
+ * omitted at the open ends of the timeline.
  */
 
 import * as THREE from 'three';
@@ -48,7 +50,12 @@ const W_PANEL_IN  = 0.4;               // relative weight of the panel-in segmen
 const W_HOLD      = 0.6;               // relative weight of the hold (dead-scroll) segment
 const W_PANEL_OUT = 0.4;               // relative weight of the panel-out segment
 const LERP        = 0.14;              // 0..1 smoothing of rendered vs target progress; 1 = off (raw 1:1)
+const NAV_SCROLL_MS = 2000;            // duration of the scroll animation when clicking a nav label
 const HOME_SCALE  = 1.9;
+
+// The browser restoring a previous scroll position on refresh would fight
+// "always start on Home" below — take manual control of that immediately.
+if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
 
 /* ══════════════════════════════════════════════════════════════
    CONFIG
@@ -127,9 +134,13 @@ function buildSegments() {
   for (let i = 0; i < FACE_ROTATIONS.length; i++) {
     const pose = facePose(i);
     if (i > 0) {
-      segs.push({ type: 'rotate', faceIdx: i, from: facePose(i - 1), to: pose, weight: W_ROTATE });
+      // Every face but the first has something to transition in from.
+      // Face 0 has no predecessor — it's just already there at progress=0,
+      // name and hint fully visible on load, not something you have to
+      // scroll to reveal.
+      segs.push({ type: 'rotate',  faceIdx: i, from: facePose(i - 1), to: pose, weight: W_ROTATE });
+      segs.push({ type: 'panelIn', faceIdx: i, pose, weight: W_PANEL_IN });
     }
-    segs.push({ type: 'panelIn', faceIdx: i, pose, weight: W_PANEL_IN });
     segs.push({ type: 'hold',    faceIdx: i, pose, weight: W_HOLD });
     if (i < FACE_ROTATIONS.length - 1) {
       segs.push({ type: 'panelOut', faceIdx: i, pose, weight: W_PANEL_OUT });
@@ -288,11 +299,32 @@ function refreshTargetProgress() {
   targetProgress = Math.min(Math.max((window.scrollY - scrollSpacerTop) / scrollRange, 0), 1);
 }
 
+// Custom animated scroll, not native `behavior:'smooth'` — that duration is
+// browser-controlled and can't reliably be slowed down. This drives
+// window.scrollTo() over NAV_SCROLL_MS instead; the render loop's own LERP
+// on top of that is what gives it its easing, so this stays linear in time.
+let navScrollToken = 0;
+
+function animateScrollTo(targetY, duration) {
+  const token   = ++navScrollToken;
+  const startY  = window.scrollY;
+  const delta   = targetY - startY;
+  const startAt = performance.now();
+
+  function step(now) {
+    if (token !== navScrollToken) return; // superseded by a newer nav click or manual scroll
+    const t = Math.min((now - startAt) / duration, 1);
+    window.scrollTo(0, startY + delta * t);
+    if (t < 1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
 function scrollToFace(faceIdx) {
   const holdSeg = SEGMENTS.find(s => s.faceIdx === faceIdx && s.type === 'hold');
   if (!holdSeg) return;
   const midProgress = (holdSeg.start + holdSeg.end) / 2;
-  window.scrollTo({ top: scrollSpacerTop + midProgress * scrollRange, behavior: 'smooth' });
+  animateScrollTo(scrollSpacerTop + midProgress * scrollRange, NAV_SCROLL_MS);
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -432,14 +464,24 @@ function updateChrome(idx) {
 
 /* ══════════════════════════════════════════════════════════════
    INPUT
-   Nav-dot clicks are the only custom input: they call native
-   window.scrollTo(), which is not scroll hijacking — it doesn't touch
-   wheel/touch handling and the user can interrupt it by scrolling at
-   any time. Everything else (wheel, trackpad, touch, scrollbar drag,
-   Space/PageDown/arrow keys) is untouched, native browser scrolling.
+   Nav-label clicks are the only custom input: they drive window.scrollTo()
+   over time (see animateScrollTo). That's not scroll hijacking — it never
+   touches wheel/touch handling, and a real wheel/touch/keyboard scroll
+   cancels it immediately (below), same as native smooth-scroll would.
+   Everything else (wheel, trackpad, touch, scrollbar drag, Space/PageDown/
+   arrow keys) is untouched, native browser scrolling.
    ══════════════════════════════════════════════════════════════ */
 function initInput() {
   window.addEventListener('scroll', refreshTargetProgress, { passive: true });
+
+  // Let the user reclaim scroll from an in-flight nav-click animation the
+  // instant they scroll themselves.
+  const cancelNavScroll = () => { navScrollToken++; };
+  window.addEventListener('wheel', cancelNavScroll, { passive: true });
+  window.addEventListener('touchstart', cancelNavScroll, { passive: true });
+  window.addEventListener('keydown', e => {
+    if (['ArrowUp','ArrowDown','PageUp','PageDown','Home','End',' '].includes(e.key)) cancelNavScroll();
+  });
 
   document.querySelectorAll('.nav-label').forEach(dot => {
     dot.addEventListener('click', () => scrollToFace(parseInt(dot.dataset.idx, 10)));
@@ -542,6 +584,11 @@ function runPreloader(onDone) {
    BOOT
    ══════════════════════════════════════════════════════════════ */
 function boot() {
+  // Always start on Home, every load/refresh — never inherit a restored
+  // or anchored scroll position (history.scrollRestoration='manual' above
+  // handles the common case; this is the guaranteed fallback).
+  window.scrollTo(0, 0);
+
   // Start loading Three.js + GLB immediately, in parallel with the preloader
   initThree();
   layoutScrollSpacer();
@@ -549,9 +596,8 @@ function boot() {
   runPreloader(() => {
     gsap.to('#scene', { opacity: 1, duration: 0.7, ease: 'power2.out' });
 
+    window.scrollTo(0, 0);
     initInput();
-    // Sync immediately to whatever scrollY already is (e.g. a mid-scroll
-    // refresh) — no animate-in-from-zero, just the correct pure state.
     refreshTargetProgress();
     renderedProgress = targetProgress;
   });
