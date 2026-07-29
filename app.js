@@ -50,8 +50,9 @@ const W_PANEL_IN  = 0.4;               // relative weight of the panel-in segmen
 const W_HOLD      = 0.6;               // relative weight of the hold (dead-scroll) segment
 const W_PANEL_OUT = 0.4;               // relative weight of the panel-out segment
 const LERP        = 0.14;              // 0..1 smoothing of rendered vs target progress; 1 = off (raw 1:1)
-const NAV_SCROLL_MS = 2000;            // duration of the scroll animation when clicking a nav label
 const HOME_SCALE  = 1.9;
+const NAV_RAD_PER_MS = (Math.PI / 2) / 450; // constant angular speed for nav-click turns: a 90° hop takes ~900ms, further hops scale proportionally
+const NAV_PANEL_MS   = 220;                 // fixed fade duration bookending a nav-click turn (departure/arrival panel only)
 
 // The browser restoring a previous scroll position on refresh would fight
 // "always start on Home" below — take manual control of that immediately.
@@ -141,7 +142,13 @@ function buildSegments() {
       segs.push({ type: 'rotate',  faceIdx: i, from: facePose(i - 1), to: pose, weight: W_ROTATE });
       segs.push({ type: 'panelIn', faceIdx: i, pose, weight: W_PANEL_IN });
     }
-    segs.push({ type: 'hold',    faceIdx: i, pose, weight: W_HOLD });
+    // Home (face 0) has no incoming rotate/panelIn to hold before — giving it
+    // a normal dead-scroll hold would make the very first bit of scroll do
+    // nothing (a "lock") before the transition away finally kicks in. Zero
+    // it out so leaving Home animates the instant the user scrolls, while
+    // still keeping a (zero-width) hold segment so nav-click-to-Home has
+    // something to target.
+    segs.push({ type: 'hold',    faceIdx: i, pose, weight: i === 0 ? 0 : W_HOLD });
     if (i < FACE_ROTATIONS.length - 1) {
       segs.push({ type: 'panelOut', faceIdx: i, pose, weight: W_PANEL_OUT });
     }
@@ -299,34 +306,6 @@ function refreshTargetProgress() {
   targetProgress = Math.min(Math.max((window.scrollY - scrollSpacerTop) / scrollRange, 0), 1);
 }
 
-// Custom animated scroll, not native `behavior:'smooth'` — that duration is
-// browser-controlled and can't reliably be slowed down. This drives
-// window.scrollTo() over NAV_SCROLL_MS instead; the render loop's own LERP
-// on top of that is what gives it its easing, so this stays linear in time.
-let navScrollToken = 0;
-
-function animateScrollTo(targetY, duration) {
-  const token   = ++navScrollToken;
-  const startY  = window.scrollY;
-  const delta   = targetY - startY;
-  const startAt = performance.now();
-
-  function step(now) {
-    if (token !== navScrollToken) return; // superseded by a newer nav click or manual scroll
-    const t = Math.min((now - startAt) / duration, 1);
-    window.scrollTo(0, startY + delta * t);
-    if (t < 1) requestAnimationFrame(step);
-  }
-  requestAnimationFrame(step);
-}
-
-function scrollToFace(faceIdx) {
-  const holdSeg = SEGMENTS.find(s => s.faceIdx === faceIdx && s.type === 'hold');
-  if (!holdSeg) return;
-  const midProgress = (holdSeg.start + holdSeg.end) / 2;
-  animateScrollTo(scrollSpacerTop + midProgress * scrollRange, NAV_SCROLL_MS);
-}
-
 /* ══════════════════════════════════════════════════════════════
    RENDER LOOP
    ══════════════════════════════════════════════════════════════ */
@@ -336,7 +315,9 @@ function renderLoop() {
   renderedProgress += (targetProgress - renderedProgress) * LERP;
   if (Math.abs(targetProgress - renderedProgress) < 0.0006) renderedProgress = targetProgress;
 
-  if (cubeGroup) render(renderedProgress);
+  // A nav-click jump (see runNavJump) owns the cube/panel state while it's
+  // in flight — the scroll-progress render() below sits out until it's done.
+  if (cubeGroup && !navAnimating) render(renderedProgress);
 
   renderer.render(scene, camera);
 }
@@ -388,6 +369,7 @@ function applyCubePose(pose) {
 let lastRenderedFace = null;
 let activeFaceEl     = null;
 let activeAccentBar  = null;
+let currentReveal    = 1; // last reveal value applied, so a nav-click jump can pick up from wherever the panel currently is
 
 function applyContent(faceIdx, reveal) {
   if (faceIdx !== lastRenderedFace) {
@@ -395,6 +377,7 @@ function applyContent(faceIdx, reveal) {
     lastRenderedFace = faceIdx;
     updateChrome(faceIdx);
   }
+  currentReveal = reveal;
 
   const homeEl  = document.getElementById('Home-overlay');
   const panelEl = document.getElementById('side-panel');
@@ -463,9 +446,109 @@ function updateChrome(idx) {
 }
 
 /* ══════════════════════════════════════════════════════════════
+   NAV-CLICK JUMPS
+   Wheel/touch/keyboard scroll is native and always scrubs through the full
+   per-face SEGMENTS timeline — that's the "flip past every side" experience
+   TIMELINE above describes. A nav-label click asks for something different:
+   go straight to one face. Scrubbing scroll-position through the normal
+   timeline can't do that without visiting every face in between, so this
+   drives its own short time-based tween directly from the cube's current
+   live pose to the target face's resting pose — one continuous turn that
+   never stops at, or even visits, any face but the start and the end.
+   Duration scales with how far the cube actually has to rotate
+   (NAV_RAD_PER_MS), so a one-face hop and a five-face hop turn at the same
+   angular speed instead of the same wall-clock time.
+   ══════════════════════════════════════════════════════════════ */
+let navAnimating = false;
+let navToken     = 0;
+
+function livePose() {
+  return {
+    euler: [cubeGroup.rotation.x, cubeGroup.rotation.y, 0],
+    x: cubeGroup.position.x,
+    y: cubeGroup.position.y,
+    scale: cubeGroup.scale.x,
+  };
+}
+
+function runNavJump(toIdx) {
+  const fromIdx = lastRenderedFace;
+  if (!cubeGroup || fromIdx === null || fromIdx === toIdx) return;
+
+  const token = ++navToken;
+  navAnimating = true;
+
+  const fromPose     = livePose();
+  const toPose       = facePose(toIdx);
+  const startReveal  = currentReveal;
+  const e0 = nearAngle(fromPose.euler[0], toPose.euler[0]);
+  const e1 = nearAngle(fromPose.euler[1], toPose.euler[1]);
+  const angularDist  = Math.hypot(e0 - fromPose.euler[0], e1 - fromPose.euler[1]);
+
+  const outMs    = NAV_PANEL_MS * startReveal; // nothing to fade out if it isn't showing
+  const rotateMs = Math.max(angularDist / NAV_RAD_PER_MS, 1);
+  const inMs     = NAV_PANEL_MS;
+  const totalMs  = outMs + rotateMs + inMs;
+  const startAt  = performance.now();
+
+  function step(now) {
+    if (token !== navToken) return; // superseded by a newer click or a manual scroll
+    const elapsed = now - startAt;
+
+    if (elapsed < outMs) {
+      applyCubePose(fromPose);
+      applyContent(fromIdx, startReveal * (1 - smoothstep(elapsed / outMs)));
+    } else if (elapsed < outMs + rotateMs) {
+      const e = smoothstep((elapsed - outMs) / rotateMs);
+      applyCubePose({
+        euler: [
+          fromPose.euler[0] + (e0 - fromPose.euler[0]) * e,
+          fromPose.euler[1] + (e1 - fromPose.euler[1]) * e,
+          0,
+        ],
+        x: fromPose.x + (toPose.x - fromPose.x) * e,
+        y: fromPose.y + (toPose.y - fromPose.y) * e,
+        scale: fromPose.scale + (toPose.scale - fromPose.scale) * e,
+      });
+      applyContent(toIdx, 0);
+    } else if (elapsed < totalMs) {
+      applyCubePose(toPose);
+      applyContent(toIdx, smoothstep((elapsed - outMs - rotateMs) / inMs));
+    } else {
+      applyCubePose(toPose);
+      applyContent(toIdx, 1);
+      finishNavJump(toIdx);
+      return;
+    }
+
+    requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
+// Once the direct turn finishes, park the real scroll position at this
+// face's hold segment so the very next wheel/touch/key scroll picks up
+// smoothly from here instead of replaying the faces skipped over.
+function finishNavJump(toIdx) {
+  navAnimating = false;
+  const holdSeg = SEGMENTS.find(s => s.faceIdx === toIdx && s.type === 'hold');
+  if (holdSeg) {
+    const midProgress = (holdSeg.start + holdSeg.end) / 2;
+    window.scrollTo(0, scrollSpacerTop + midProgress * scrollRange);
+  }
+  refreshTargetProgress();
+  renderedProgress = targetProgress;
+}
+
+function cancelNavJump() {
+  navToken++;
+  navAnimating = false;
+}
+
+/* ══════════════════════════════════════════════════════════════
    INPUT
-   Nav-label clicks are the only custom input: they drive window.scrollTo()
-   over time (see animateScrollTo). That's not scroll hijacking — it never
+   Nav-label clicks are the only custom input: they drive a direct nav-jump
+   tween (see runNavJump above). That's not scroll hijacking — it never
    touches wheel/touch handling, and a real wheel/touch/keyboard scroll
    cancels it immediately (below), same as native smooth-scroll would.
    Everything else (wheel, trackpad, touch, scrollbar drag, Space/PageDown/
@@ -474,17 +557,16 @@ function updateChrome(idx) {
 function initInput() {
   window.addEventListener('scroll', refreshTargetProgress, { passive: true });
 
-  // Let the user reclaim scroll from an in-flight nav-click animation the
+  // Let the user reclaim scroll from an in-flight nav-click jump the
   // instant they scroll themselves.
-  const cancelNavScroll = () => { navScrollToken++; };
-  window.addEventListener('wheel', cancelNavScroll, { passive: true });
-  window.addEventListener('touchstart', cancelNavScroll, { passive: true });
+  window.addEventListener('wheel', cancelNavJump, { passive: true });
+  window.addEventListener('touchstart', cancelNavJump, { passive: true });
   window.addEventListener('keydown', e => {
-    if (['ArrowUp','ArrowDown','PageUp','PageDown','Home','End',' '].includes(e.key)) cancelNavScroll();
+    if (['ArrowUp','ArrowDown','PageUp','PageDown','Home','End',' '].includes(e.key)) cancelNavJump();
   });
 
   document.querySelectorAll('.nav-label').forEach(dot => {
-    dot.addEventListener('click', () => scrollToFace(parseInt(dot.dataset.idx, 10)));
+    dot.addEventListener('click', () => runNavJump(parseInt(dot.dataset.idx, 10)));
   });
 }
 
