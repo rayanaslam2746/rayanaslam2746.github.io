@@ -1,13 +1,36 @@
 /**
- * CUBE PORTFOLIO — SPLIT-SCREEN STATE MACHINE
+ * CUBE PORTFOLIO — NATIVE-SCROLL TIMELINE
  *
  * Home:   cube centered, name above, hint below
  * Scroll: cube slides left, panel slides in from right
  * Next:   cube slides right, panel slides in from left
  * Pattern: cube alternates sides, content always on opposite side
  *
- * STATE MACHINE:
- * IDLE → HIDE_CONTENT → ROTATE → LOCK → PAUSE → REVEAL → IDLE
+ * ARCHITECTURE
+ * Scroll is 100% native. A tall spacer element (#scroll-spacer) gives the
+ * document real height; #scene is `position:fixed`, so it stays pinned to
+ * the viewport while the document scrolls behind it. We never call
+ * preventDefault and never read/accumulate wheel deltaY — we only ever
+ * read `window.scrollY`, which the browser (and its scrollbar, keyboard,
+ * trackpad momentum, touch) manages entirely on its own.
+ *
+ * scrollY is mapped to a single scalar `targetProgress` ∈ [0,1]. A rAF loop
+ * eases a `renderedProgress` value toward it (this is what turns discrete
+ * mouse-wheel notches into fluid motion) and calls the one pure function,
+ * render(progress), which derives cube pose + panel state entirely from
+ * that number. Same progress in -> same visual state out, always. There is
+ * no other path that mutates cube rotation, position, scale, or panel
+ * opacity — no timers, no tween queues, no state that can drift out of
+ * sync with scroll.
+ *
+ * TIMELINE
+ * For each face we build four segments in order: rotate (turn from the
+ * previous face into this one, scrubbed 1:1) -> panelIn (cube frozen,
+ * panel slides in) -> hold (frozen, dead scroll) -> panelOut (frozen,
+ * panel slides out) -> next face's rotate. The very first face has no
+ * incoming rotate (nothing to rotate from) and the very last face has no
+ * outgoing panelOut (nothing to transition to) — those two segments are
+ * simply omitted at the open ends of the timeline.
  */
 
 import * as THREE from 'three';
@@ -15,6 +38,17 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 
 const gsap = window.gsap;
+
+/* ══════════════════════════════════════════════════════════════
+   TUNABLE CONSTANTS
+   ══════════════════════════════════════════════════════════════ */
+const SCROLL_LENGTH_MULTIPLIER = 2.5;  // viewport-heights of scroll per face (overall pacing)
+const W_ROTATE    = 1.4;               // relative weight of the rotate segment
+const W_PANEL_IN  = 0.4;               // relative weight of the panel-in segment
+const W_HOLD      = 0.6;               // relative weight of the hold (dead-scroll) segment
+const W_PANEL_OUT = 0.4;               // relative weight of the panel-out segment
+const LERP        = 0.14;              // 0..1 smoothing of rendered vs target progress; 1 = off (raw 1:1)
+const HOME_SCALE  = 1.9;
 
 /* ══════════════════════════════════════════════════════════════
    CONFIG
@@ -33,7 +67,7 @@ const FACE_ACCENTS = [
 ];
 
 /* ══════════════════════════════════════════════════════════════
-   FACE ROTATION MAP
+   FACE ROTATION MAP — unchanged rotation keyframes / visual path.
    Index 0 shows the white (+y) face toward camera.
    ══════════════════════════════════════════════════════════════ */
 const FACE_ROTATIONS = [
@@ -46,45 +80,7 @@ const FACE_ROTATIONS = [
 ];
 
 /* ══════════════════════════════════════════════════════════════
-   STATE MACHINE
-   ══════════════════════════════════════════════════════════════ */
-const State = {
-  IDLE:         'IDLE',
-  HIDE_CONTENT: 'HIDE_CONTENT',
-  ROTATE:       'ROTATE',
-  LOCK:         'LOCK',
-  PAUSE:        'PAUSE',
-  REVEAL:       'REVEAL',
-};
-let currentState    = State.IDLE;
-let currentFaceIdx  = 0;
-let isTransitioning = false;
-
-// Continuous scroll-driven state
-let scrollFacePos      = 0;
-let scrollVelocity     = 0;
-let scrollSettleTimer  = null;
-let settleRevealTimer  = null;
-const SCROLL_SENS      = 1 / 2500;
-const SCROLL_FRICTION  = 0.85;
-const SETTLE_MS        = 400;
-const HOME_SCALE       = 1.9;
-
-/* ══════════════════════════════════════════════════════════════
-   THREE.JS GLOBALS
-   ══════════════════════════════════════════════════════════════ */
-let renderer, scene, camera;
-let cubeGroup;
-let mouseTarget  = { x: 0, y: 0 };
-let mouseSmooth  = { x: 0, y: 0 };
-let mouseClientX = 0;
-let mouseClientY = 0;
-
-let glbReady = false;
-let onGlbReady = null;
-
-/* ══════════════════════════════════════════════════════════════
-   POSITION HELPERS
+   POSITION HELPERS — unchanged
    ══════════════════════════════════════════════════════════════ */
 function getCubeTargetX(faceIdx) {
   if (faceIdx === 0) return 0;
@@ -107,6 +103,70 @@ function nearAngle(from, to) {
   const d = ((to - from) % (2 * Math.PI) + 3 * Math.PI) % (2 * Math.PI) - Math.PI;
   return from + d;
 }
+
+function smoothstep(t) {
+  t = Math.min(Math.max(t, 0), 1);
+  return t * t * (3 - 2 * t);
+}
+
+function facePose(idx) {
+  return {
+    euler: FACE_ROTATIONS[idx].euler,
+    x: getCubeTargetX(idx),
+    y: getCubeTargetY(idx),
+    scale: getCubeTargetScale(idx),
+  };
+}
+
+/* ══════════════════════════════════════════════════════════════
+   TIMELINE — ordered, weighted segments built once from the
+   (unmodified) face keyframes above.
+   ══════════════════════════════════════════════════════════════ */
+function buildSegments() {
+  const segs = [];
+  for (let i = 0; i < FACE_ROTATIONS.length; i++) {
+    const pose = facePose(i);
+    if (i > 0) {
+      segs.push({ type: 'rotate', faceIdx: i, from: facePose(i - 1), to: pose, weight: W_ROTATE });
+    }
+    segs.push({ type: 'panelIn', faceIdx: i, pose, weight: W_PANEL_IN });
+    segs.push({ type: 'hold',    faceIdx: i, pose, weight: W_HOLD });
+    if (i < FACE_ROTATIONS.length - 1) {
+      segs.push({ type: 'panelOut', faceIdx: i, pose, weight: W_PANEL_OUT });
+    }
+  }
+  const totalWeight = segs.reduce((sum, s) => sum + s.weight, 0);
+  let acc = 0;
+  for (const seg of segs) {
+    seg.start = acc / totalWeight;
+    acc += seg.weight;
+    seg.end = acc / totalWeight;
+  }
+  return segs;
+}
+
+const SEGMENTS = buildSegments();
+
+function locateSegment(p) {
+  for (const seg of SEGMENTS) {
+    if (p <= seg.end) {
+      const span = seg.end - seg.start;
+      const t = span > 0 ? (p - seg.start) / span : 1;
+      return { segment: seg, t: Math.min(Math.max(t, 0), 1) };
+    }
+  }
+  const last = SEGMENTS[SEGMENTS.length - 1];
+  return { segment: last, t: 1 };
+}
+
+/* ══════════════════════════════════════════════════════════════
+   THREE.JS GLOBALS
+   ══════════════════════════════════════════════════════════════ */
+let renderer, scene, camera;
+let cubeGroup;
+
+let glbReady = false;
+let onGlbReady = null;
 
 /* ══════════════════════════════════════════════════════════════
    SCENE SETUP
@@ -135,13 +195,8 @@ function initThree() {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
-  });
-
-  window.addEventListener('mousemove', e => {
-    mouseTarget.x = (e.clientX / window.innerWidth  - 0.5) * 2;
-    mouseTarget.y = (e.clientY / window.innerHeight - 0.5) * 2;
-    mouseClientX  = e.clientX;
-    mouseClientY  = e.clientY;
+    layoutScrollSpacer();
+    refreshTargetProgress();
   });
 
   renderLoop();
@@ -202,7 +257,7 @@ function loadGLB() {
     newGroup.add(model);
     newGroup.rotation.set(...FACE_ROTATIONS[0].euler);
     newGroup.position.set(0, getCubeTargetY(0), 0);
-    newGroup.scale.setScalar(0);
+    newGroup.scale.setScalar(HOME_SCALE);
     scene.add(newGroup);
     cubeGroup = newGroup;
 
@@ -214,145 +269,149 @@ function loadGLB() {
 }
 
 /* ══════════════════════════════════════════════════════════════
+   NATIVE SCROLL → PROGRESS
+   ══════════════════════════════════════════════════════════════ */
+let scrollSpacerTop = 0;
+let scrollRange      = 1; // containerHeight - viewportHeight, guarded against 0
+let targetProgress   = 0;
+let renderedProgress = 0;
+
+function layoutScrollSpacer() {
+  const spacer = document.getElementById('scroll-spacer');
+  const height = window.innerHeight * SCROLL_LENGTH_MULTIPLIER * FACE_ROTATIONS.length;
+  spacer.style.height = height + 'px';
+  scrollSpacerTop = spacer.offsetTop;
+  scrollRange = Math.max(height - window.innerHeight, 1);
+}
+
+function refreshTargetProgress() {
+  targetProgress = Math.min(Math.max((window.scrollY - scrollSpacerTop) / scrollRange, 0), 1);
+}
+
+function scrollToFace(faceIdx) {
+  const holdSeg = SEGMENTS.find(s => s.faceIdx === faceIdx && s.type === 'hold');
+  if (!holdSeg) return;
+  const midProgress = (holdSeg.start + holdSeg.end) / 2;
+  window.scrollTo({ top: scrollSpacerTop + midProgress * scrollRange, behavior: 'smooth' });
+}
+
+/* ══════════════════════════════════════════════════════════════
    RENDER LOOP
    ══════════════════════════════════════════════════════════════ */
 function renderLoop() {
   requestAnimationFrame(renderLoop);
 
-  if (currentState === 'SCROLLING' && cubeGroup) {
-    scrollVelocity *= SCROLL_FRICTION;
-    scrollFacePos  += scrollVelocity;
-    updateChrome(getNearestFace(scrollFacePos));
-    const [rx, ry, rz] = getScrollRotation(scrollFacePos);
-    cubeGroup.rotation.x = rx;
-    cubeGroup.rotation.y = ry;
-    cubeGroup.rotation.z = rz;
-  }
+  renderedProgress += (targetProgress - renderedProgress) * LERP;
+  if (Math.abs(targetProgress - renderedProgress) < 0.0006) renderedProgress = targetProgress;
 
-  if (currentState === State.IDLE) {
-    mouseSmooth.x += (mouseTarget.x - mouseSmooth.x) * 0.04;
-    mouseSmooth.y += (mouseTarget.y - mouseSmooth.y) * 0.04;
-
-    if (cubeGroup) {
-      cubeGroup.rotation.x = THREE.MathUtils.lerp(
-        cubeGroup.rotation.x,
-        FACE_ROTATIONS[currentFaceIdx].euler[0] - mouseSmooth.y * 0.035,
-        0.06
-      );
-      cubeGroup.rotation.y = THREE.MathUtils.lerp(
-        cubeGroup.rotation.y,
-        FACE_ROTATIONS[currentFaceIdx].euler[1] + mouseSmooth.x * 0.035,
-        0.06
-      );
-    }
-  }
+  if (cubeGroup) render(renderedProgress);
 
   renderer.render(scene, camera);
 }
 
 /* ══════════════════════════════════════════════════════════════
-   STICKER EMISSIVE PULSE
+   THE PURE RENDER FUNCTION
+   Given the same progress, always produces the same cube pose and
+   panel state. Nothing else in this file writes to cube rotation,
+   position, scale, or panel opacity.
    ══════════════════════════════════════════════════════════════ */
-function pulseActiveStickers(intensity) {
-  if (!cubeGroup) return;
+function render(p) {
+  const { segment, t } = locateSegment(p);
+  const e = smoothstep(t);
+
+  let pose, faceIdx, reveal;
+
+  if (segment.type === 'rotate') {
+    const from = segment.from, to = segment.to;
+    pose = {
+      euler: [
+        from.euler[0] + (nearAngle(from.euler[0], to.euler[0]) - from.euler[0]) * e,
+        from.euler[1] + (nearAngle(from.euler[1], to.euler[1]) - from.euler[1]) * e,
+        0,
+      ],
+      x: from.x + (to.x - from.x) * e,
+      y: from.y + (to.y - from.y) * e,
+      scale: from.scale + (to.scale - from.scale) * e,
+    };
+    faceIdx = segment.faceIdx; // the face being rotated INTO
+    reveal  = 0;               // cube is turning — panel/overlay stays hidden
+  } else {
+    pose    = segment.pose;    // cube frozen at this face's resting pose
+    faceIdx = segment.faceIdx;
+    if (segment.type === 'panelIn')  reveal = e;
+    if (segment.type === 'hold')     reveal = 1;
+    if (segment.type === 'panelOut') reveal = 1 - e;
+  }
+
+  applyCubePose(pose);
+  applyContent(faceIdx, reveal);
+}
+
+function applyCubePose(pose) {
+  cubeGroup.rotation.set(pose.euler[0], pose.euler[1], 0);
+  cubeGroup.position.set(pose.x, pose.y, 0);
+  cubeGroup.scale.setScalar(pose.scale);
+}
+
+let lastRenderedFace = null;
+let activeFaceEl     = null;
+let activeAccentBar  = null;
+
+function applyContent(faceIdx, reveal) {
+  if (faceIdx !== lastRenderedFace) {
+    setActivePanel(faceIdx);
+    lastRenderedFace = faceIdx;
+    updateChrome(faceIdx);
+  }
+
+  const homeEl  = document.getElementById('Home-overlay');
+  const panelEl = document.getElementById('side-panel');
+  const interactive = reveal > 0.5 ? 'auto' : 'none';
+
+  if (faceIdx === 0) {
+    gsap.set(homeEl, { opacity: reveal, y: (1 - reveal) * 16 });
+    gsap.set(panelEl, { opacity: 0 });
+    homeEl.style.pointerEvents  = interactive;
+    panelEl.style.pointerEvents = 'none';
+  } else {
+    const dir = faceIdx % 2 === 1 ? 1 : -1;
+    gsap.set(panelEl, { opacity: reveal, x: (1 - reveal) * 40 * dir });
+    gsap.set(homeEl, { opacity: 0 });
+    panelEl.style.pointerEvents = interactive;
+    homeEl.style.pointerEvents  = 'none';
+    if (activeFaceEl)    activeFaceEl.style.pointerEvents = interactive;
+    if (activeAccentBar) gsap.set(activeAccentBar, { scaleX: reveal });
+  }
+
+  applyStickerGlow(reveal);
+}
+
+function applyStickerGlow(reveal) {
+  const intensity = 0.04 + reveal * 0.16;
   cubeGroup.traverse(c => {
     if (c.isMesh && c.userData.isSticker && c.material) {
-      gsap.to(c.material, { emissiveIntensity: intensity, duration: 0.6, ease: 'power2.out' });
+      c.material.emissiveIntensity = intensity;
     }
   });
 }
 
-/* ══════════════════════════════════════════════════════════════
-   HOME OVERLAY
-   ══════════════════════════════════════════════════════════════ */
-function showHomeOverlay(isFirst) {
-  const el    = document.getElementById('Home-overlay');
-  const items = el.querySelectorAll('.Home-name, .Home-hint');
-  gsap.fromTo(el,    { opacity: 0, y: isFirst ? 0 : 16 }, { opacity: 1, y: 0, duration: 0.5, ease: 'power3.out' });
-  gsap.fromTo(items, { opacity: 0, y: 14 }, { opacity: 1, y: 0, duration: 0.6, stagger: 0.1, ease: 'power3.out', delay: 0.1 });
-}
-
-function hideHomeOverlay(onComplete) {
-  const el = document.getElementById('Home-overlay');
-  gsap.to(el, { opacity: 0, y: -18, duration: 0.3, ease: 'power2.in', onComplete });
-}
-
-/* ══════════════════════════════════════════════════════════════
-   SIDE PANEL
-   ══════════════════════════════════════════════════════════════ */
-function showPanel(faceIdx) {
-  const panel = document.getElementById('side-panel');
-
+function setActivePanel(faceIdx) {
   document.querySelectorAll('.panel-face').forEach(f => {
     f.style.opacity       = '0';
     f.style.pointerEvents = 'none';
   });
+  activeAccentBar = null;
+  activeFaceEl    = null;
 
-  const face = document.getElementById(`panel-${faceIdx}`);
-  if (face) {
-    face.style.opacity       = '1';
-    face.style.pointerEvents = 'auto';
-  }
-
-  panel.className = getPanelClass(faceIdx);
-
-  const xStart = faceIdx % 2 === 1 ? 50 : -50;
-  gsap.fromTo(panel,
-    { x: xStart, opacity: 0 },
-    { x: 0, opacity: 1, duration: 0.55, ease: 'power3.out' }
-  );
-
-  if (face) {
-    const eyebrow   = face.querySelector('.panel-eyebrow');
-    const title     = face.querySelector('.panel-title');
-    const accentBar = face.querySelector('.panel-accent-bar');
-    const remaining = Array.from(face.children).filter(c =>
-      !c.classList.contains('panel-eyebrow') &&
-      !c.classList.contains('panel-title')   &&
-      !c.classList.contains('panel-accent-bar')
-    );
-
-    if (eyebrow) {
-      gsap.fromTo(eyebrow,
-        { opacity: 0, y: 7 },
-        { opacity: 1, y: 0, duration: 0.38, ease: 'power3.out', delay: 0.1 }
-      );
-    }
-    if (title) {
-      gsap.fromTo(title,
-        { opacity: 0, y: 24 },
-        { opacity: 1, y: 0, duration: 0.6, ease: 'power3.out', delay: 0.17 }
-      );
-    }
-    if (accentBar) {
-      gsap.fromTo(accentBar,
-        { scaleX: 0 },
-        { scaleX: 1, duration: 0.72, ease: 'power3.out', delay: 0.32 }
-      );
-    }
-    if (remaining.length) {
-      gsap.fromTo(remaining,
-        { opacity: 0, y: 16 },
-        { opacity: 1, y: 0, duration: 0.52, stagger: 0.07, ease: 'power3.out', delay: 0.38 }
-      );
+  if (faceIdx !== 0) {
+    document.getElementById('side-panel').className = getPanelClass(faceIdx);
+    const face = document.getElementById(`panel-${faceIdx}`);
+    if (face) {
+      face.style.opacity = '1';
+      activeFaceEl        = face;
+      activeAccentBar      = face.querySelector('.panel-accent-bar');
     }
   }
-}
-
-function hidePanel(onComplete) {
-  const panel = document.getElementById('side-panel');
-  const xOut  = panel.classList.contains('on-right') ? 60 : -60;
-  gsap.to(panel, {
-    x: xOut, opacity: 0, duration: 0.28, ease: 'power2.in',
-    onComplete: () => {
-      gsap.set(panel, { x: 0 });
-      document.querySelectorAll('.panel-face').forEach(f => {
-        f.style.opacity       = '0';
-        f.style.pointerEvents = 'none';
-      });
-      onComplete?.();
-    }
-  });
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -365,247 +424,25 @@ function updateChrome(idx) {
   if (faceIdx)  faceIdx.textContent  = String(idx + 1).padStart(2, '0');
 
   document.querySelectorAll('.nav-label').forEach((d, i) => d.classList.toggle('active', i === idx));
-  gsap.to('#page-name', { opacity: idx === 0 ? 0 : 1, duration: 0.35, ease: 'power2.out' });
+  const pageName = document.getElementById('page-name');
+  if (pageName) pageName.style.opacity = idx === 0 ? '0' : '1';
 
   document.documentElement.style.setProperty('--accent-global', FACE_ACCENTS[idx]);
 }
 
 /* ══════════════════════════════════════════════════════════════
-   CONTINUOUS SCROLL HELPERS
-   ══════════════════════════════════════════════════════════════ */
-function getScrollRotation(facePos) {
-  const total = FACE_ROTATIONS.length;
-  const norm  = ((facePos % total) + total) % total;
-  const i     = Math.floor(norm);
-  const frac  = norm - i;
-  const from  = FACE_ROTATIONS[i].euler;
-  const to    = FACE_ROTATIONS[(i + 1) % total].euler;
-  return [
-    from[0] + (nearAngle(from[0], to[0]) - from[0]) * frac,
-    from[1] + (nearAngle(from[1], to[1]) - from[1]) * frac,
-    from[2] + (nearAngle(from[2], to[2]) - from[2]) * frac,
-  ];
-}
-
-function getNearestFace(facePos) {
-  const total = FACE_ROTATIONS.length;
-  return Math.round(((facePos % total) + total) % total) % total;
-}
-
-function beginScrolling() {
-  if (currentState === 'SCROLLING') return;
-  if (currentState === 'HIDING') return;
-  if (currentState !== State.IDLE) return;
-
-  currentState  = 'HIDING';
-  scrollFacePos = currentFaceIdx;
-
-  const onHideComplete = () => {
-    if (currentState !== 'HIDING') return;
-    gsap.killTweensOf(cubeGroup.rotation);
-    gsap.to(cubeGroup.position, { x: 0, y: 0, duration: 0.4, ease: 'power2.out' });
-    gsap.to(cubeGroup.scale, { x: 1, y: 1, z: 1, duration: 0.4, ease: 'power2.out' });
-    currentState = 'SCROLLING';
-    scheduleSettle();
-  };
-
-  if (currentFaceIdx === 0) {
-    hideHomeOverlay(onHideComplete);
-  } else {
-    hidePanel(onHideComplete);
-  }
-}
-
-function scheduleSettle() {
-  clearTimeout(scrollSettleTimer);
-  scrollSettleTimer = setTimeout(beginSettling, SETTLE_MS);
-}
-
-function beginSettling() {
-  if (currentState !== 'SCROLLING') return;
-  currentState   = 'SETTLING';
-  scrollVelocity = 0;
-
-  const nearFace    = getNearestFace(scrollFacePos);
-  const target      = FACE_ROTATIONS[nearFace].euler;
-  const targetX     = getCubeTargetX(nearFace);
-  const targetY     = getCubeTargetY(nearFace);
-  const targetScale = getCubeTargetScale(nearFace);
-
-  gsap.to(cubeGroup.rotation, {
-    x: nearAngle(cubeGroup.rotation.x, target[0]),
-    y: nearAngle(cubeGroup.rotation.y, target[1]),
-    z: 0,
-    duration: 0.7,
-    ease: 'power3.out',
-  });
-
-  gsap.to(cubeGroup.scale, {
-    x: targetScale, y: targetScale, z: targetScale,
-    duration: 0.7, ease: 'power3.out',
-  });
-
-  gsap.to(cubeGroup.position, {
-    x: targetX,
-    y: targetY,
-    duration: 0.7,
-    ease: 'power3.out',
-    onComplete: () => {
-      cubeGroup.rotation.set(...target);
-      cubeGroup.position.set(targetX, targetY, 0);
-      cubeGroup.scale.setScalar(targetScale);
-      mouseSmooth.x = 0;
-      mouseSmooth.y = 0;
-
-      currentFaceIdx = nearFace;
-      scrollFacePos  = nearFace;
-
-      updateChrome(nearFace);
-      currentState = 'REVEALING';
-
-      if (nearFace === 0) {
-        showHomeOverlay(false);
-      } else {
-        showPanel(nearFace);
-      }
-
-      settleRevealTimer = setTimeout(() => { currentState = State.IDLE; }, 1100);
-    },
-  });
-}
-
-function snapToFace(targetIdx) {
-  if (currentState === 'SCROLLING' || currentState === 'SETTLING' || currentState === 'REVEALING') {
-    clearTimeout(scrollSettleTimer);
-    clearTimeout(settleRevealTimer);
-    gsap.killTweensOf(cubeGroup.rotation);
-    gsap.killTweensOf(cubeGroup.position);
-    scrollFacePos = targetIdx;
-    currentState  = 'SCROLLING';
-    beginSettling();
-    return;
-  }
-  transitionToFace(targetIdx);
-}
-
-/* ══════════════════════════════════════════════════════════════
-   STATE MACHINE — TRANSITION
-   ══════════════════════════════════════════════════════════════ */
-function transitionToFace(nextIdx) {
-  if (isTransitioning || currentState === 'SCROLLING' || currentState === 'SETTLING' || currentState === 'REVEALING') return;
-  if (nextIdx === currentFaceIdx) return;
-  if (nextIdx < 0 || nextIdx >= FACE_ROTATIONS.length) return;
-
-  isTransitioning = true;
-  currentState    = State.HIDE_CONTENT;
-
-  const blocker = document.getElementById('transition-blocker');
-  if (blocker) blocker.classList.add('active');
-
-  pulseActiveStickers(0.04);
-
-  const onHideComplete = () => {
-    currentState = State.ROTATE;
-
-    const target      = FACE_ROTATIONS[nextIdx].euler;
-    const targetX     = getCubeTargetX(nextIdx);
-    const targetY     = getCubeTargetY(nextIdx);
-    const targetScale = getCubeTargetScale(nextIdx);
-
-    gsap.to(camera.position, { z: 9.0, duration: 0.25, ease: 'power2.in' });
-    gsap.to(cubeGroup.position, { x: targetX, y: targetY, duration: 1.3, ease: 'power3.inOut' });
-    gsap.to(cubeGroup.scale, { x: targetScale, y: targetScale, z: targetScale, duration: 1.3, ease: 'power3.inOut' });
-
-    gsap.to(cubeGroup.rotation, {
-      x: nearAngle(cubeGroup.rotation.x, target[0]),
-      y: nearAngle(cubeGroup.rotation.y, target[1]),
-      z: 0,
-      duration: 1.3,
-      ease: 'power2.inOut',
-      onComplete: onRotateComplete,
-    });
-  };
-
-  if (currentFaceIdx === 0) {
-    hideHomeOverlay(onHideComplete);
-  } else {
-    hidePanel(onHideComplete);
-  }
-
-  function onRotateComplete() {
-    cubeGroup.rotation.set(...FACE_ROTATIONS[nextIdx].euler);
-    cubeGroup.scale.setScalar(getCubeTargetScale(nextIdx));
-    mouseSmooth.x = 0;
-    mouseSmooth.y = 0;
-
-    gsap.to(camera.position, { z: 9.5, duration: 0.35, ease: 'power2.out' });
-
-    currentFaceIdx = nextIdx;
-    updateChrome(currentFaceIdx);
-
-    currentState = State.PAUSE;
-    setTimeout(() => {
-      currentState = State.REVEAL;
-      pulseActiveStickers(0.2);
-
-      if (nextIdx === 0) {
-        showHomeOverlay(false);
-      } else {
-        showPanel(nextIdx);
-      }
-
-      setTimeout(() => {
-        currentState    = State.IDLE;
-        isTransitioning = false;
-        if (blocker) blocker.classList.remove('active');
-      }, 600);
-    }, 300);
-  }
-}
-
-/* ══════════════════════════════════════════════════════════════
    INPUT
+   Nav-dot clicks are the only custom input: they call native
+   window.scrollTo(), which is not scroll hijacking — it doesn't touch
+   wheel/touch handling and the user can interrupt it by scrolling at
+   any time. Everything else (wheel, trackpad, touch, scrollbar drag,
+   Space/PageDown/arrow keys) is untouched, native browser scrolling.
    ══════════════════════════════════════════════════════════════ */
 function initInput() {
-  function onWheel(e) {
-    const delta = e.deltaY || e.deltaX;
-    if (Math.abs(delta) < 2) return;
-    if (currentFaceIdx !== 0) {
-      const panel = document.getElementById('side-panel');
-      const rect  = panel.getBoundingClientRect();
-      if (mouseClientX >= rect.left && mouseClientX <= rect.right &&
-          mouseClientY >= rect.top  && mouseClientY <= rect.bottom) {
-        return;
-      }
-    }
-    // Hold off scroll input while panels are mid-animation so they never get torn
-    if (currentState === 'SETTLING' || currentState === 'REVEALING') return;
-    beginScrolling();
-    if (currentState !== 'SCROLLING' && currentState !== 'HIDING') return;
-    scrollVelocity += delta * SCROLL_SENS;
-    if (currentState === 'SCROLLING') scheduleSettle();
-  }
-  window.addEventListener('wheel', onWheel, { passive: true });
-  document.getElementById('main-canvas').addEventListener('wheel', onWheel, { passive: true });
-
-  window.addEventListener('keydown', e => {
-    if (e.key === 'ArrowDown' || e.key === 'ArrowRight' || e.key === 'j') transitionToFace(currentFaceIdx + 1);
-    else if (e.key === 'ArrowUp' || e.key === 'ArrowLeft' || e.key === 'k') transitionToFace(currentFaceIdx - 1);
-  });
-
-  let touchY0 = 0;
-  window.addEventListener('touchstart', e => { touchY0 = e.touches[0].clientY; }, { passive: true });
-  window.addEventListener('touchmove', e => {
-    const dy = touchY0 - e.touches[0].clientY;
-    if (Math.abs(dy) < 3) return;
-    touchY0 = e.touches[0].clientY;
-    onWheel({ deltaY: dy, deltaX: 0 });
-    e.preventDefault();
-  }, { passive: false });
-  window.addEventListener('touchend', () => { scheduleSettle(); });
+  window.addEventListener('scroll', refreshTargetProgress, { passive: true });
 
   document.querySelectorAll('.nav-label').forEach(dot => {
-    dot.addEventListener('click', () => snapToFace(parseInt(dot.dataset.idx)));
+    dot.addEventListener('click', () => scrollToFace(parseInt(dot.dataset.idx, 10)));
   });
 }
 
@@ -707,22 +544,16 @@ function runPreloader(onDone) {
 function boot() {
   // Start loading Three.js + GLB immediately, in parallel with the preloader
   initThree();
+  layoutScrollSpacer();
 
   runPreloader(() => {
     gsap.to('#scene', { opacity: 1, duration: 0.7, ease: 'power2.out' });
 
     initInput();
-    updateChrome(0);
-
-    if (cubeGroup) {
-      cubeGroup.position.y = getCubeTargetY(0);
-      cubeGroup.scale.set(0, 0, 0);
-      gsap.to(cubeGroup.scale, { x: HOME_SCALE, y: HOME_SCALE, z: HOME_SCALE, duration: 1.1, ease: 'back.out(1.4)' });
-    }
-    setTimeout(() => {
-      showHomeOverlay(true);
-      currentState = State.IDLE;
-    }, 280);
+    // Sync immediately to whatever scrollY already is (e.g. a mid-scroll
+    // refresh) — no animate-in-from-zero, just the correct pure state.
+    refreshTargetProgress();
+    renderedProgress = targetProgress;
   });
 }
 

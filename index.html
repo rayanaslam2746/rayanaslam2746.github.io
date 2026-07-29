@@ -11,6 +11,10 @@
 </head>
 <body>
 
+<!-- Gives the document real scrollable height; app.js sizes this in JS.
+     #scene below is position:fixed, so it stays pinned while this scrolls. -->
+<div id="scroll-spacer"></div>
+
 <div id="preloader">
   <canvas id="pre-canvas"></canvas>
   <div class="pre-ui">
@@ -29,7 +33,7 @@
       <h1 class="Home-name">Rayan Aslam</h1>
     </div>
     <div class="Home-hint">
-      <span class="hint-label">Scroll to Learn More</span>
+      <span class="hint-label">Scroll the Cube to Learn More</span>
     </div>
   </div>
 
@@ -233,8 +237,6 @@
     </div>
     <div id="corner-sig">RA</div>
   </div>
-
-  <div id="transition-blocker"></div>
 
 </div>
 
