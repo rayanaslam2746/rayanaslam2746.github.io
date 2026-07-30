@@ -11,7 +11,7 @@
 
   --text:         #161616;
   --text-muted:   #5A5A5A;
-  --text-dim:     #AAAAAA;
+  --text-dim:     #4d4d4d;
 
   /* Updated globally via JS on each face transition */
   --accent-global: #555555;
@@ -102,22 +102,6 @@ button { font-family: inherit; background: none; border: none; cursor: pointer; 
   line-height: .88;
   letter-spacing: -.045em;
   color: var(--text);
-}
-
-.Home-hint {
-  position: absolute;
-  top: 28vh;
-  left: 0; right: 0;
-  display: flex;
-  justify-content: center;
-  align-items: center;
-}
-.hint-label {
-  font-family: var(--font-mono);
-  font-size: 15px;
-  letter-spacing: .22em;
-  color: var(--text-dim);
-  text-transform: uppercase;
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -245,7 +229,7 @@ button { font-family: inherit; background: none; border: none; cursor: pointer; 
 .about-meta-label {
   font-family: var(--font-mono);
   font-size: 13px;
-  letter-spacing: .2em;
+  letter-spacing: .1em;
   text-transform: uppercase;
   color: var(--text-dim);
   flex-shrink: 0;
@@ -425,6 +409,28 @@ button { font-family: inherit; background: none; border: none; cursor: pointer; 
   flex-shrink: 0;
 }
 
+.entry-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: .4rem;
+  flex-shrink: 0;
+}
+
+.project-link {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--accent);
+  text-decoration: none;
+  transition: opacity .25s ease;
+}
+
+.project-link:hover {
+  opacity: .6;
+}
+
 /* ══════════════════════════════════════════════════════════════
    Panel 5 — Contact
    ══════════════════════════════════════════════════════════════ */
@@ -545,7 +551,7 @@ button { font-family: inherit; background: none; border: none; cursor: pointer; 
   pointer-events: auto;
   transition: color .32s ease, letter-spacing .3s ease, font-size .25s ease;
   line-height: 1.2;
-  opacity: .55;
+  opacity: .80;
 }
 
 .nav-label.active {
