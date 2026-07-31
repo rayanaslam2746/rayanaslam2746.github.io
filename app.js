@@ -61,7 +61,7 @@ const NAV_PANEL_MS   = 220;                 // fixed fade duration bookending a 
 
 // Mobile-only tunables (see initMobile below).
 const MOBILE_CUBE_Y      = 1.6;   // world-units up: centers cube in the top half. Tune on device.
-const MOBILE_CUBE_SCALE  = 0.8;   // cube size on mobile. Tune on device so it fills the top half with margin.
+const MOBILE_CUBE_SCALE  = 0.7;   // cube size on mobile. Tune on device so it fills the top half with margin.
 const MOBILE_ROT_SPEED   = 0.008; // radians of cube rotation per px of finger drag
 const MOBILE_SNAP_MS     = 420;   // ease-to-nearest-face duration on release
 const MOBILE_DRAG_THRESH = 6;     // px of movement before a touch counts as a drag (below this = a tap, ignored)

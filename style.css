@@ -654,7 +654,7 @@ button { font-family: inherit; background: none; border: none; cursor: pointer; 
 
   /* Dedicated Home panel (mobile only — desktop never activates faceIdx 0) */
   #panel-0 { justify-content: center; text-align: center; }
-  #panel-0 .panel-title { font-size: clamp(3.2rem, 15vw, 5.5rem); margin-bottom: 1.5rem; }
+  #panel-0 .panel-title { font-size: clamp(4.8rem, 26vw, 9rem); line-height: .87; margin-bottom: 1.5rem; }
   #panel-0 .panel-body { margin: 0 auto; }
 
   .Home-name   { font-size: clamp(2.5rem, 10vw, 4rem); }
