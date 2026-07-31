@@ -41,6 +41,11 @@ import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 
 const gsap = window.gsap;
 
+// Chosen once at load; the same 768px breakpoint used in style.css. Desktop
+// and mobile share one scene/camera/renderer/GLB/preloader and diverge only
+// at the fork hooks marked IS_MOBILE below.
+const IS_MOBILE = window.matchMedia('(max-width: 768px)').matches;
+
 /* ══════════════════════════════════════════════════════════════
    TUNABLE CONSTANTS
    ══════════════════════════════════════════════════════════════ */
@@ -53,6 +58,13 @@ const LERP        = 0.14;              // 0..1 smoothing of rendered vs target p
 const HOME_SCALE  = 1.9;
 const NAV_RAD_PER_MS = (Math.PI / 2) / 450; // constant angular speed for nav-click turns: a 90° hop takes ~900ms, further hops scale proportionally
 const NAV_PANEL_MS   = 220;                 // fixed fade duration bookending a nav-click turn (departure/arrival panel only)
+
+// Mobile-only tunables (see initMobile below).
+const MOBILE_CUBE_Y      = 1.6;   // world-units up: centers cube in the top half. Tune on device.
+const MOBILE_CUBE_SCALE  = 0.8;   // cube size on mobile. Tune on device so it fills the top half with margin.
+const MOBILE_ROT_SPEED   = 0.008; // radians of cube rotation per px of finger drag
+const MOBILE_SNAP_MS     = 420;   // ease-to-nearest-face duration on release
+const MOBILE_DRAG_THRESH = 6;     // px of movement before a touch counts as a drag (below this = a tap, ignored)
 
 // The browser restoring a previous scroll position on refresh would fight
 // "always start on Home" below — take manual control of that immediately.
@@ -296,6 +308,7 @@ let renderedProgress = 0;
 
 function layoutScrollSpacer() {
   const spacer = document.getElementById('scroll-spacer');
+  if (IS_MOBILE) { spacer.style.height = '0px'; scrollRange = 1; return; }
   const height = window.innerHeight * SCROLL_LENGTH_MULTIPLIER * FACE_ROTATIONS.length;
   spacer.style.height = height + 'px';
   scrollSpacerTop = spacer.offsetTop;
@@ -317,7 +330,8 @@ function renderLoop() {
 
   // A nav-click jump (see runNavJump) owns the cube/panel state while it's
   // in flight — the scroll-progress render() below sits out until it's done.
-  if (cubeGroup && !navAnimating) render(renderedProgress);
+  // On mobile the cube pose is owned entirely by the mobile touch controller.
+  if (!IS_MOBILE && cubeGroup && !navAnimating) render(renderedProgress);
 
   renderer.render(scene, camera);
 }
@@ -570,6 +584,173 @@ function initInput() {
   });
 }
 
+/* ══════════════════════════════════════════════════════════════
+   MOBILE CONTROLLER
+   Cube pinned in the top half; the user drags it freely and on
+   release it eases to the nearest of the 6 canonical FACE_ROTATIONS
+   poses (the same upright resting poses desktop uses), landing on
+   the matching content panel in the bottom half. This owns
+   cubeGroup's rotation entirely on mobile — renderLoop() skips
+   render(progress) via the IS_MOBILE guard above, so this never
+   fights the scroll-driven path. Never touches targetProgress /
+   renderedProgress / SEGMENTS.
+   ══════════════════════════════════════════════════════════════ */
+const FACE_QUATS = FACE_ROTATIONS.map(f => {
+  const e = new THREE.Euler(f.euler[0], f.euler[1], f.euler[2] ?? 0, 'XYZ');
+  return new THREE.Quaternion().setFromEuler(e);
+});
+
+// Local-frame outward normal of each face, at rest. Used at snap time to
+// pick the face pointing most toward the camera regardless of roll about
+// the view axis (see mobileSnap).
+const CAMERA_DIR = new THREE.Vector3(0, 0, 1);
+const FACE_NORMALS = FACE_QUATS.map(q =>
+  CAMERA_DIR.clone().applyQuaternion(q.clone().invert())
+);
+
+// Each face has 4 valid "level" resting rolls (0/90/180/270 about the view
+// axis) — a real cube face can come to rest with any of its four edges
+// "up". FACE_QUATS only encodes one fixed roll per face, so snapping straight
+// to FACE_QUATS[best] always forced the same edge up no matter how the user
+// had rolled the cube (e.g. white always landing with green on the bottom).
+// Rotating about CAMERA_DIR after FACE_QUATS[i] keeps the face's normal
+// pointed exactly at the camera (still level) while sweeping through all 4.
+const FACE_ROLL_QUATS = FACE_QUATS.map(q => [0, 1, 2, 3].map(k => {
+  const roll = new THREE.Quaternion().setFromAxisAngle(CAMERA_DIR, k * Math.PI / 2);
+  return new THREE.Quaternion().multiplyQuaternions(roll, q);
+}));
+
+let mobileFace       = 0;
+let mobileDragging   = false;
+let mobileDragMoved  = false;
+let mobileLastX = 0, mobileLastY = 0;
+let mobileSnapToken  = 0;
+let mobileYaw = 0, mobilePitch = 0;   // net drag displacement for the current gesture
+let mobileDragBaseQuat = null;        // cube's orientation when this gesture started
+
+function initMobile() {
+  cubeGroup.position.set(0, MOBILE_CUBE_Y, 0);
+  cubeGroup.scale.setScalar(MOBILE_CUBE_SCALE);
+  cubeGroup.quaternion.copy(FACE_QUATS[0]);
+
+  mobileFace = 0;
+  setActivePanel(0);
+  updateChrome(0);
+  showMobilePanelContent(0);
+  gsap.set('#side-panel', { opacity: 1 });
+
+  const canvas = document.getElementById('main-canvas');
+  canvas.addEventListener('touchstart', onMobileTouchStart, { passive: false });
+  canvas.addEventListener('touchmove',  onMobileTouchMove,  { passive: false });
+  canvas.addEventListener('touchend',   onMobileTouchEnd,   { passive: false });
+  canvas.addEventListener('touchcancel', onMobileTouchEnd,  { passive: false });
+}
+
+function onMobileTouchStart(e) {
+  if (e.touches.length !== 1) return;
+  mobileSnapToken++; // a new drag cancels any in-flight snap
+  mobileDragging  = true;
+  mobileDragMoved = false;
+  mobileYaw = 0;
+  mobilePitch = 0;
+  mobileDragBaseQuat = cubeGroup.quaternion.clone();
+  mobileLastX = e.touches[0].clientX;
+  mobileLastY = e.touches[0].clientY;
+}
+
+function onMobileTouchMove(e) {
+  if (!mobileDragging || e.touches.length !== 1) return;
+  e.preventDefault();
+
+  const x = e.touches[0].clientX;
+  const y = e.touches[0].clientY;
+  const dx = x - mobileLastX;
+  const dy = y - mobileLastY;
+  mobileLastX = x;
+  mobileLastY = y;
+
+  if (!mobileDragMoved && Math.hypot(dx, dy) >= MOBILE_DRAG_THRESH) {
+    mobileDragMoved = true;
+    gsap.to('#side-panel', { opacity: 0, duration: 0.15, ease: 'power1.out' });
+  }
+  if (!mobileDragMoved) return;
+
+  // Accumulate NET yaw/pitch for this gesture and rebuild the orientation
+  // fresh from the pre-drag pose every step, instead of composing many
+  // small per-step rotations onto the live quaternion. Composing
+  // incrementally is path-dependent — a curved finger drag (which real
+  // drags always are) racks up roll around the view axis step by step,
+  // which is what was showing up as an unwanted twist at rest and a big
+  // "unnecessary" turn on snap. Rebuilding from the total displacement
+  // makes the result depend only on where the drag ends up, not the
+  // shape of the path it took to get there.
+  mobileYaw   += dx * MOBILE_ROT_SPEED;
+  mobilePitch += dy * MOBILE_ROT_SPEED;
+  const qx = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), mobilePitch);
+  const qy = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), mobileYaw);
+  cubeGroup.quaternion.copy(mobileDragBaseQuat).premultiply(qy).premultiply(qx);
+}
+
+function onMobileTouchEnd() {
+  if (!mobileDragging) return;
+  mobileDragging = false;
+  if (mobileDragMoved) mobileSnap(); // a tap (no real movement) does nothing
+}
+
+function mobileSnap() {
+  const token = ++mobileSnapToken;
+  const cur = cubeGroup.quaternion.clone();
+  // Roll-invariant: pick whichever face's outward normal currently points
+  // most toward the camera (+Z), not whichever upright pose is nearest in
+  // full orientation — a face can be dead-on to the camera but spun about
+  // the view axis, and angleTo() would wrongly favor a neighboring face.
+  let best = 0, bestZ = -Infinity;
+  for (let i = 0; i < FACE_NORMALS.length; i++) {
+    const z = FACE_NORMALS[i].clone().applyQuaternion(cur).z;
+    if (z > bestZ) { bestZ = z; best = i; }
+  }
+  // Among that face's 4 valid level rolls, snap to whichever is nearest to
+  // the cube's current orientation — this is what lets the user's own roll
+  // decide which edge ends up "up" instead of always forcing the same one.
+  let to = FACE_ROLL_QUATS[best][0], bestAngle = Infinity;
+  for (const cand of FACE_ROLL_QUATS[best]) {
+    const a = cur.angleTo(cand);
+    if (a < bestAngle) { bestAngle = a; to = cand; }
+  }
+  const from = cur;
+  const start = performance.now();
+  function step(now) {
+    if (token !== mobileSnapToken) return; // superseded by a new drag
+    const t = Math.min((now - start) / MOBILE_SNAP_MS, 1);
+    const e = smoothstep(t);
+    cubeGroup.quaternion.copy(from).slerp(to, e);
+    if (t < 1) { requestAnimationFrame(step); return; }
+    mobileFace = best;
+    setActivePanel(best);
+    updateChrome(best);
+    showMobilePanelContent(best);
+    gsap.to('#side-panel', { opacity: 1, duration: 0.25, ease: 'power2.out' });
+  }
+  requestAnimationFrame(step);
+}
+
+// setActivePanel() (reused from desktop) already resets every .panel-face —
+// including #panel-0 — to opacity:0/pointer-events:none, then for faceIdx!==0
+// reveals #panel-{idx} and records it as activeFaceEl. Desktop never activates
+// faceIdx 0 (it shows #Home-overlay instead), so #panel-0 is what mobile uses
+// for the Home face; this just layers that on top and, since applyContent()
+// (the desktop reveal/pointer-events driver) never runs on mobile, makes the
+// landed panel actually interactive (links, resume download, etc).
+function showMobilePanelContent(idx) {
+  const home = document.getElementById('panel-0');
+  if (idx === 0) {
+    if (home) { home.style.opacity = '1'; home.style.pointerEvents = 'auto'; }
+  } else {
+    if (home) { home.style.opacity = '0'; home.style.pointerEvents = 'none'; }
+    if (activeFaceEl) activeFaceEl.style.pointerEvents = 'auto';
+  }
+}
+
 /* ═════════════════════════════════════════════════════════════
    PRELOADER
    ═════════════════════════════════════════════════════════════ */
@@ -678,11 +859,23 @@ function boot() {
   runPreloader(() => {
     gsap.to('#scene', { opacity: 1, duration: 0.7, ease: 'power2.out' });
 
-    window.scrollTo(0, 0);
-    initInput();
-    refreshTargetProgress();
-    renderedProgress = targetProgress;
+    if (IS_MOBILE) {
+      initMobile();
+    } else {
+      window.scrollTo(0, 0);
+      initInput();
+      refreshTargetProgress();
+      renderedProgress = targetProgress;
+    }
   });
 }
+
+// Rotating the device or resizing across the 768px boundary re-picks the
+// mode cleanly via a reload. Keyed on width only — mobile URL bars
+// constantly change viewport height, and that alone must not reload.
+window.addEventListener('resize', () => {
+  const nowMobile = window.matchMedia('(max-width: 768px)').matches;
+  if (nowMobile !== IS_MOBILE) location.reload();
+});
 
 boot();
