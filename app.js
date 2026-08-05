@@ -38,8 +38,14 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { inject } from '@vercel/analytics';
 
 const gsap = window.gsap;
+
+// Vercel Web Analytics — site-wide (not a mobile/desktop-fork concern), so
+// it runs unconditionally and as early as possible, independent of the
+// preloader/cube boot sequence below.
+inject();
 
 // Chosen once at load; the same 768px breakpoint used in style.css. Desktop
 // and mobile share one scene/camera/renderer/GLB/preloader and diverge only
