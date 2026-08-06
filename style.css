@@ -56,17 +56,28 @@ button { font-family: inherit; background: none; border: none; cursor: pointer; 
   justify-content: center;
   gap: 2.4rem;
 }
-#pre-canvas { width: 100px; height: 100px; display: block; }
-.pre-ui { display: flex; flex-direction: column; align-items: center; gap: .7rem; }
-.pre-mono {
+.pre-ui { display: flex; flex-direction: column; align-items: center; }
+.pre-type {
+  display: flex;
+  align-items: baseline;
   font-family: var(--font-mono);
-  font-size: 8px;
-  letter-spacing: .28em;
-  text-transform: uppercase;
-  color: var(--text-dim);
+  font-size: clamp(2.6rem, 7vw, 5.5rem);
+  font-weight: 700;
+  letter-spacing: -.01em;
+  color: var(--text);
 }
-.pre-bar-track { width: 100px; height: 1px; background: var(--border); }
-.pre-bar { height: 100%; width: 0; background: var(--text); transition: width .05s linear; }
+.pre-caret {
+  display: inline-block;
+  width: .5em;
+  height: 1.05em;
+  margin-left: .1em;
+  background: var(--text);
+  animation: pre-caret-blink 1s step-end infinite;
+}
+@keyframes pre-caret-blink {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0; }
+}
 
 /* ── Scene ────────────────────────────────────────────────────── */
 #scene { position: fixed; inset: 0; overflow: hidden; }

@@ -761,78 +761,50 @@ function showMobilePanelContent(idx) {
    PRELOADER
    ═════════════════════════════════════════════════════════════ */
 function runPreloader(onDone) {
-  const canvas = document.getElementById('pre-canvas');
-  canvas.width  = 100;
-  canvas.height = 100;
-  const ctx = canvas.getContext('2d');
-  const bar = document.getElementById('pre-bar');
-  const lbl = document.getElementById('pre-label');
+  const preEl  = document.getElementById('preloader');
+  const textEl = document.getElementById('pre-type-text');
+  const FULL = 'Rayan Aslam';
+  const CHAR_DELAY = 90;
 
-  const dots = ['', '.', '..', '...'];
-  let dotIdx = 0;
-  const dotTimer = setInterval(() => {
-    dotIdx = (dotIdx + 1) % 4;
-    lbl.textContent = 'Loading' + dots[dotIdx];
-  }, 380);
+  let typingDone = false, resolved = false, typeTimer = null;
 
-  let prog = 0, done = false;
-
-  function drawCube(t) {
-    ctx.clearRect(0, 0, 100, 100);
-    const cx = 50, cy = 50;
-    const s  = Math.min(t, 1);
-    ctx.save();
-    ctx.translate(cx, cy);
-    ctx.rotate(t * Math.PI * 1.4);
-    ctx.scale(s * 0.88, s * 0.88);
-    // Top face
-    ctx.beginPath(); ctx.moveTo(0,-28); ctx.lineTo(24,-15); ctx.lineTo(0,-2); ctx.lineTo(-24,-15); ctx.closePath();
-    ctx.fillStyle = '#1968D2'; ctx.fill();
-    // Left face
-    ctx.beginPath(); ctx.moveTo(-24,-15); ctx.lineTo(0,-2); ctx.lineTo(0,22); ctx.lineTo(-24,9); ctx.closePath();
-    ctx.fillStyle = '#2B8A57'; ctx.fill();
-    // Right face
-    ctx.beginPath(); ctx.moveTo(0,-2); ctx.lineTo(24,-15); ctx.lineTo(24,9); ctx.lineTo(0,22); ctx.closePath();
-    ctx.fillStyle = '#D93A2F'; ctx.fill();
-    // Edges
-    ctx.strokeStyle = 'rgba(0,0,0,0.1)'; ctx.lineWidth = 0.5;
-    ctx.beginPath(); ctx.moveTo(0,-28); ctx.lineTo(24,-15); ctx.lineTo(0,-2); ctx.lineTo(-24,-15); ctx.closePath(); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(0,-2); ctx.lineTo(0,22); ctx.moveTo(-24,-15); ctx.lineTo(-24,9); ctx.moveTo(24,-15); ctx.lineTo(24,9); ctx.stroke();
-    ctx.restore();
+  function type(i) {
+    textEl.textContent = FULL.slice(0, i);
+    if (i < FULL.length) {
+      typeTimer = setTimeout(() => type(i + 1), CHAR_DELAY);
+    } else {
+      typingDone = true;
+      tryFinish();
+    }
   }
+  type(0);
 
-  function fadeOut() {
+  function tryFinish() {
+    if (resolved || !typingDone) return;
+    if (!glbReady) { onGlbReady = tryFinish; return; }
+    resolved = true;
     setTimeout(() => {
       gsap.to('#preloader', {
         opacity: 0, duration: 0.65, ease: 'power2.inOut',
         onComplete: () => {
-          document.getElementById('preloader').style.display = 'none';
+          preEl.style.display = 'none';
           onDone();
         }
       });
     }, 300);
   }
 
-  function finish() {
-    if (done) return;
-    done = true;
-    clearInterval(dotTimer);
-    bar.style.width = '100%';
-    lbl.textContent = 'Ready';
-    if (glbReady) {
-      fadeOut();
-    } else {
-      onGlbReady = fadeOut;
-    }
+  // Click/keydown skips straight to the full name; still waits for the
+  // real GLB load before fading out (tryFinish re-checks glbReady).
+  function skip() {
+    if (typingDone) return;
+    clearTimeout(typeTimer);
+    textEl.textContent = FULL;
+    typingDone = true;
+    tryFinish();
   }
-
-  const START = Date.now(), DUR = 2200;
-  const timer = setInterval(() => {
-    prog = Math.min((Date.now() - START) / DUR, 1);
-    bar.style.width = (prog * 100) + '%';
-    drawCube(prog);
-    if (prog >= 1) { clearInterval(timer); finish(); }
-  }, 16);
+  preEl.addEventListener('click', skip, { once: true });
+  document.addEventListener('keydown', skip, { once: true });
 
   // Safety: if GLB never loads, unblock after 12s
   setTimeout(() => {
@@ -842,11 +814,7 @@ function runPreloader(onDone) {
       onGlbReady = null;
       cb?.();
     }
-    finish();
   }, 12000);
-
-  canvas.parentElement.addEventListener('click', finish, { once: true });
-  document.addEventListener('keydown', finish, { once: true });
 }
 
 /* ══════════════════════════════════════════════════════════════
